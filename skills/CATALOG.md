@@ -1,10 +1,11 @@
 # Skill Catalog
 
-43 active skills: 42 device/family skills and one shared Google Cast skill.
+44 active skills: 42 device/family skills and two shared workflow/protocol skills.
 Use the matching device skill for model compatibility, setup, safety and supported operations.
 
-## Shared protocol
+## Shared workflow and protocol
 
+- [Physical Gadget approval](gadget-physical-approval/SKILL.md) — fail-closed Approve/Deny confirmation before consequential actions.
 - [Google Cast](gadget-google-cast/SKILL.md) — media, volume and existing speaker groups.
 
 ## Lights and plugs

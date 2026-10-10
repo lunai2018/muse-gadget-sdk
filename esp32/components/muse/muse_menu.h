@@ -39,6 +39,8 @@ typedef enum {
 /* Safe from any task. */
 void muse_menu_key(muse_menu_key_t key);
 bool muse_menu_is_open(void);
+/* Safe from any task. The LVGL task closes the menu on its next tick. */
+void muse_menu_request_close(void);
 
 /* LVGL task only. */
 void muse_menu_build(lv_obj_t *parent, int w, int h);

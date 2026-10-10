@@ -50,10 +50,10 @@ if len(sys.argv) > 4:
 rd(0.3)
 keys, command, line = keys.partition('>')
 for k in keys:
-    s.write(k.encode()); time.sleep(0.35)
+    s.write(f'>key={k}\n'.encode()); time.sleep(0.35)
 if command:
     s.write(f'>{line}\n'.encode()); time.sleep(0.35)
-s.write(b'p')
+s.write(b'>key=p\n')
 log = rd(20, b'SNAP END', b'SNAP OFF').decode('latin1')   # 20 s: a UART console at 115200 takes ~8 s for 135x240
 if 'SNAP BEGIN' not in log:
     sys.exit('screenshots are off in this build: MUSE_BENCH=1 tools/muse/board.sh build|flash <board>'

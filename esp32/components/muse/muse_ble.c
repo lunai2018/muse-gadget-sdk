@@ -16,6 +16,7 @@
 
 #include "muse_ble.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,14 +96,16 @@ static int build_status(char *out, size_t len)
                     "\"wifi\":{\"on\":%s,\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d},"
                     "\"hatch\":{\"host\":\"%s\",\"vm\":\"%s\",\"token\":%s,\"state\":\"%s\"},"
                     "\"link\":{\"paired\":%s,\"state\":\"%s\"},"
-                    "\"volume\":%d,\"speaker\":%s,\"mic_gain\":%d,\"brightness\":%d,\"sleep\":%d,\"last\":\"%s\"}",
+                    "\"volume\":%d,\"speaker\":%s,\"mic_gain\":%d,\"brightness\":%d,\"sleep\":%d,"
+                    "\"tts\":{\"provider\":\"azure\",\"configured\":%s,\"persisted\":%s},\"last\":\"%s\"}",
                     s_name, esp_app_get_description()->version, p.battery_pct,
                     muse_settings_wifi_on() ? "true" : "false", wifi_state_name(w.state), ssid_e, w.ip, w.rssi,
                     host_e, vm_e, muse_settings_hatch_token_len() ? "true" : "false", muse_hatch_state_name(h.state),
                     muse_link_hatch_linked() ? "true" : "false", muse_link_state_name(muse_link_state()),
                     muse_settings_volume(), muse_settings_speaker_on() ? "true" : "false",
-                    muse_settings_mic_gain(), muse_settings_brightness(),
-                    muse_settings_sleep_s(), last_e);
+                    muse_settings_mic_gain(), muse_settings_brightness(), muse_settings_sleep_s(),
+                    muse_settings_azure_tts_configured() ? "true" : "false",
+                    muse_settings_azure_tts_persisted() ? "true" : "false", last_e);
 }
 
 static bool parse_int(const char *v, int lo, int hi, int *out)
@@ -113,6 +116,19 @@ static bool parse_int(const char *v, int lo, int hi, int *out)
         return false;
     }
     *out = (int)n;
+    return true;
+}
+
+static bool safe_tts_name(const char *v)
+{
+    if (!v || !v[0]) {
+        return false;
+    }
+    for (; *v; v++) {
+        if (!(isalnum((unsigned char)*v) || *v == '-' || *v == '_' || *v == '.')) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -159,6 +175,25 @@ static void run_command(char *cmd)
         }
     } else if (!strcmp(cmd, "hatch.test")) {
         muse_hatch_test();
+    } else if (!strcmp(cmd, "tts.azure.key")) {
+        esp_err_t err = muse_settings_set_azure_tts_key(v);
+        if (err != ESP_OK) {
+            res = err == ESP_ERR_INVALID_SIZE ? "error: key too long" : "error: storage write failed";
+        }
+    } else if (!strcmp(cmd, "tts.azure.region") && safe_tts_name(v)
+               && strlen(v) <= MUSE_TTS_REGION_MAX) {
+        if (muse_settings_set_azure_tts_region(v) != ESP_OK) {
+            res = "error: storage write failed";
+        }
+    } else if (!strcmp(cmd, "tts.azure.voice") && safe_tts_name(v)
+               && strlen(v) <= MUSE_TTS_VOICE_MAX) {
+        if (muse_settings_set_azure_tts_voice(v) != ESP_OK) {
+            res = "error: storage write failed";
+        }
+    } else if (!strcmp(cmd, "tts.azure.clear")) {
+        if (muse_settings_set_azure_tts_key("") != ESP_OK) {
+            res = "error: storage write failed";
+        }
     } else if (!strcmp(cmd, "test.loopback")) {
         muse_voice_request_loopback();
     } else if (!strcmp(cmd, "volume") && parse_int(v, 0, 100, &n)) {
@@ -176,7 +211,8 @@ static void run_command(char *cmd)
     }
 
     /* Never echo secrets back. */
-    bool secret = !strcmp(cmd, "wifi.pass") || !strncmp(cmd, "hatch.token", 11);
+    bool secret = !strcmp(cmd, "wifi.pass") || !strncmp(cmd, "hatch.token", 11)
+                  || !strcmp(cmd, "tts.azure.key");
     snprintf(s_last, sizeof(s_last), "%s: %s", cmd, res);
     ESP_LOGI(TAG, "cmd %s%s%s -> %s", cmd, secret ? "" : "=", secret ? "" : v, res);
     muse_state_poke();

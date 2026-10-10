@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "muse_audio.h"
+#include "muse_approval.h"
 #include "muse_battery.h"
 #include "muse_board.h"
 #include "muse_ble.h"
@@ -67,6 +68,7 @@ void muse_app_run(const muse_board_t *board)
     ESP_ERROR_CHECK(board->init());
     ESP_ERROR_CHECK(muse_settings_init());
     muse_settings_set_listener(on_setting);
+    muse_approval_init();
     muse_state_init();
     muse_battery_init();
     muse_state_set_caption("WAKING UP...");

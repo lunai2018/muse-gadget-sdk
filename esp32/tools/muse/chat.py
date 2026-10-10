@@ -125,7 +125,17 @@ class Board:
             raise BoardError("pyserial is missing: python3 -m pip install pyserial")
         self.port = port
         try:
-            self.ser = serial.Serial(port, 115200, timeout=0.05)
+            # Configure the modem-control lines before opening the port. Some
+            # CH340K boards wire them to EN/BOOT; Serial(port, ...) opens first
+            # with the defaults and can reset a running board before we get a
+            # chance to deassert them.
+            self.ser = serial.Serial()
+            self.ser.port = port
+            self.ser.baudrate = 115200
+            self.ser.timeout = 0.05
+            self.ser.dtr = False
+            self.ser.rts = False
+            self.ser.open()
         except (serial.SerialException, OSError) as e:
             code = getattr(e, "errno", None)
             if code in (errno.EPERM, errno.EACCES, errno.EBUSY) or "Permission" in str(e) or "busy" in str(e):

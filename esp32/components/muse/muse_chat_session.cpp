@@ -36,9 +36,10 @@
  * a stream buffer of reply audio. A generation number tags each turn so that
  * events and audio of a cancelled turn are dropped.
  *
- * A typed turn (muse_hatch_text_turn, from the serial console) skips steps 1
- * and 3: the text goes to /chat/stream and the reply streams back to the
- * console as "@chat" lines instead of to the voice task.
+ * A typed turn (muse_hatch_text_turn, from the serial console) skips step 1:
+ * the text goes to /chat/stream and the reply streams back to the console as
+ * "@chat" lines. Finished replies also use the normal display/TTS path, so a
+ * remote text request behaves like a real Gadget turn when the speaker is on.
  */
 
 #include <atomic>
@@ -67,8 +68,11 @@ extern "C" {
 #include "cJSON.h"
 #include "minimp3.h"
 #include "muse_account_api.h"
+#include "muse_azure_tts.h"
+#include "muse_input.h"
 #include "muse_link.h"
 #include "muse_settings.h"
+#include "muse_voice.h"
 #include "muse_wifi.h"
 }
 #include "muse_chat_priv.h"
@@ -100,8 +104,8 @@ static const char *TAG = "muse_chat_session";
 #define EV_TEXT 72
 #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
 #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
-#define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
-#define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
+#define TEXT_CHARS_PER_S 16                /* visible UTF-8 characters per second */
+#define TEXT_HOLD_S 5                      /* speaker off: keep the final reading page visible */
 
 #define PING_US (20 * 1000000LL)
 #define DEAD_US (60 * 1000000LL)           /* nothing from the server, pongs included */
@@ -234,6 +238,7 @@ struct turn_t {
     msg_t msgs[MAX_MSGS];
     int nmsgs;
     bool agent_busy;
+    bool playback_requested; /* typed turn has woken the voice task exactly once */
     /* TTS */
     int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
     bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
@@ -302,7 +307,7 @@ static void *json_alloc(size_t n)
 
 static void emit(muse_hatch_ev_t type, const char *text)
 {
-    if (s_turn.text) {
+    if (s_turn.text && !s_turn.playback_requested) {
         return;   /* typed turns report to the console instead */
     }
     ev_t ev = {};
@@ -1377,23 +1382,70 @@ static void message_done(int i, const char *final_text)
     m.done = true;
     mark(M_DONE);
     if (s_turn.text) {
-        /* The whole text if the pieces didn't add up to it (a line skipped, say): the reader uses it instead. */
+        /* Keep the console's loss-recovery event, and also retain the same
+         * final text for the display/TTS path. */
         size_t n = m.len;
         if (final_text && final_text[0] && strlen(final_text) != m.len) {
             n = strlen(final_text);
             muse_hatch_console("final", final_text, "\"msg\":%d", i);
+            if (s_turn.texts) {
+                char *full = s_turn.texts + i * TEXT_MAX;
+                strlcpy(full, final_text, TEXT_MAX);
+            }
+            strlcpy(m.tail, final_text, sizeof(m.tail));
+            m.len = n;
         }
         muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
-        ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-        return;
-    }
-    if (!m.len && final_text && final_text[0]) {
+    } else if (!m.len && final_text && final_text[0]) {
         append_text(m, final_text);
     }
     if (m.len && m.tts == TTS_NONE) {
         m.tts = TTS_QUEUED;
     }
+    if (s_turn.text && m.tts == TTS_QUEUED && !s_turn.playback_requested) {
+        s_turn.playback_requested = true;
+        muse_input_wake("text reply");
+        // Text replies suppress early REPLY events until playback is requested.
+        // Re-emit here so page 1 is rendered before Azure TTS produces audio.
+        emit(MUSE_HATCH_EV_REPLY, nullptr);
+        muse_voice_request_text_reply();
+    }
     ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
+}
+
+static void tts_data(const uint8_t *data, size_t len);
+static void decode(void);
+
+static void log_tts_memory(const char *stage)
+{
+    ESP_LOGI(TAG, "TTS memory %s: internal=%u largest=%u psram=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* Azure's HTTP callback runs on hatch_task. Feed the existing incremental
+ * decoder immediately; if decoded PCM is briefly full, keep the compressed
+ * data in PSRAM and apply backpressure before accepting another chunk. */
+static esp_err_t azure_tts_chunk(const uint8_t *data, size_t len, void *ctx)
+{
+    (void)ctx;
+    int64_t deadline = now_us() + IO_TIMEOUT_US;
+    while (len > MP3_BUF - s_turn.mp3_len) {
+        decode();
+        if (len <= MP3_BUF - s_turn.mp3_len) {
+            break;
+        }
+        if (now_us() >= deadline) {
+            ESP_LOGW(TAG, "TTS playback backpressure timed out");
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    tts_data(data, len);
+    decode();
+    return ESP_OK;
 }
 
 static const char *msg_id(cJSON *payload, cJSON *event)
@@ -1460,7 +1512,7 @@ static void on_event(cJSON *line)
         const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "text"));
         if (text && text[0] && s_turn.text) {
             mark(M_TEXT);
-            m.len += strlen(text);
+            append_text(m, text);
             muse_hatch_console("text", text, "\"msg\":%d", i);
         } else if (text && text[0]) {
             mark(M_TEXT);
@@ -1511,28 +1563,47 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
-         */
         m.pcm_start = s_turn.pcm_out;
-        m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+        const char *full = s_turn.texts ? s_turn.texts + i * TEXT_MAX : m.tail;
+        m.pcm_frames = 0;
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
-        s_turn.silent = true;
-        ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        s_turn.mp3_len = 0;
+        s_turn.mp3_ended = false;
+        s_turn.kbps = 0;
+        s_turn.down_rate = 0;
+        mp3dec_init(&s_turn.dec);
         show_reply_start(m);
+
+        /* Azure 每收到一块 MP3 就调用 azure_tts_chunk，首帧无需等整段下载。 */
+        if (muse_settings_speaker_on() && muse_settings_azure_tts_configured()) {
+            mark(M_TTS);
+            s_turn.silent = false;
+            size_t total_bytes = 0;
+            log_tts_memory("before");
+            esp_err_t err = muse_azure_tts_stream(full, azure_tts_chunk, nullptr, &total_bytes);
+            log_tts_memory("after");
+            if (err == ESP_OK) {
+                s_turn.mp3_ended = true;
+                decode();
+                ESP_LOGI(TAG, "Azure TTS complete: %u bytes", (unsigned)total_bytes);
+                return;
+            }
+            ESP_LOGW(TAG, "Azure TTS unavailable (%s); showing reply silently", esp_err_to_name(err));
+            s_turn.mp3_len = 0;
+        }
+
+        /* 未配置或请求失败时保留原行为：用静音时长驱动字幕与回合结束。 */
+        size_t shown_chars = 0;
+        for (const unsigned char *p = reinterpret_cast<const unsigned char *>(full); *p; p++) {
+            if ((*p & 0xc0) != 0x80) {
+                shown_chars++;
+            }
+        }
+        m.pcm_frames = (uint32_t)(shown_chars * MIC_RATE / TEXT_CHARS_PER_S);
+        s_turn.silent = true;
+        ESP_LOGI(TAG, "showing message %s (%u bytes, %u chars)", m.id,
+                 (unsigned)m.len, (unsigned)shown_chars);
         return;
     }
 }
@@ -1665,8 +1736,10 @@ static void check_turn(void)
         return;
     }
     if (!s_turn.nmsgs) {
-        /* A typed turn waits as long as the agent says it's working. */
-        if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !(text && s_turn.agent_busy)) {
+        /* Any turn waits while the agent explicitly says it is working. Voice
+         * replies may legitimately arrive after the display has gone dark;
+         * the overall turn cap still prevents an infinite wait. */
+        if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !s_turn.agent_busy) {
             turn_fail("NO REPLY FROM MUSE");
         }
         return;

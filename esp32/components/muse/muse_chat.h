@@ -122,8 +122,8 @@ size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms
 /* ---- Typed turns from the serial console (CONFIG_MUSE_HATCH only) ---- */
 
 /*
- * Sends typed text to the chat. The reply isn't spoken or captioned: it goes to
- * the console as it streams in, however long it is, one line per piece:
+ * Sends typed text to the chat. The reply goes to the console as it streams in
+ * and, when the speaker is enabled, through the normal caption/TTS player:
  *   @chat {"seq":N,"type":TYPE,...}
  * TYPE is "sent" (bytes), "busy" (on: the agent is working), "text" (msg, text),
  * "message_done" (msg, bytes), "done" (messages, complete) or "error" (text).

@@ -30,12 +30,19 @@
 
 /* Captions page to the screen; the console lines tested here don't. */
 static int s_cols = 16, s_lines = 2;
+static int s_page, s_pages;
 
 void muse_state_page(bool cjk, int *cols, int *lines)
 {
     (void)cjk;
     *cols = s_cols;
     *lines = s_lines;
+}
+
+void muse_state_set_reply_page(int page, int pages)
+{
+    s_page = page;
+    s_pages = pages;
 }
 
 static char *read_all(size_t *len)
@@ -93,8 +100,16 @@ int main(int argc, char **argv)
         if (muse_hatch_caption_at(in, 0, page, sizeof(page))) {
             fputs(page, stdout);
         }
+    } else if (argc > 3 && !strcmp(argv[1], "caption-page")) {
+        s_cols = atoi(argv[2]);
+        s_lines = atoi(argv[3]);
+        size_t at = argc > 4 ? (size_t)strtoul(argv[4], NULL, 10) : 0;
+        static char page[1 << 16];
+        if (muse_hatch_caption_at(in, at, page, sizeof(page))) {
+            printf("%d/%d\n%s", s_page, s_pages, page);
+        }
     } else {
-        fprintf(stderr, "usage: %s console|unescape|caption COLS < input\n", argv[0]);
+        fprintf(stderr, "usage: %s console|unescape|caption COLS|caption-page COLS LINES [AT] < input\n", argv[0]);
         return 2;
     }
     free(in);

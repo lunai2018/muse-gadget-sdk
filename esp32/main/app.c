@@ -73,6 +73,9 @@
 #endif
 #if CONFIG_MUSE_ENABLED
 #include "muse_glue.h"
+#include "muse_approval.h"
+#include "muse_input.h"
+#include "muse_settings.h"
 // Muse joins Wi-Fi from its own settings, before or without pairing.
 #define WIFI_WITHOUT_PAIRING 1
 #else
@@ -665,6 +668,11 @@ static bool complete_setup_and_stop_ble(const char *reason, uint32_t session_gen
     } else if (!config_mark_setup_complete()) {
         ESP_LOGW(TAG, "failed to mark setup complete");
     }
+#if CONFIG_MUSE_ENABLED
+    /* A previous manual Wi-Fi Off setting lives outside the pairing namespace.
+     * Provisioning new credentials must leave the newly paired device online. */
+    muse_settings_set_wifi_on(true);
+#endif
     setup_window_lock_take();
     advance_confirm_generation_locked();
     setup_window_lock_give();
@@ -1624,6 +1632,103 @@ static cJSON *command_error(const char *code, const char *message) {
     return result;
 }
 
+#if CONFIG_MUSE_ENABLED
+typedef struct {
+    noise_ctrl_session_generation_t session_generation;
+    char request_id[64];
+    uint32_t timeout_ms;
+} approval_task_args_t;
+
+static void approval_task(void *arg) {
+    approval_task_args_t *args = arg;
+    muse_approval_result_t decision;
+    if (!muse_approval_wait_visible(pdMS_TO_TICKS(5000))) {
+        muse_approval_cancel();
+        decision = MUSE_APPROVAL_NOT_DISPLAYED;
+    } else {
+        decision = muse_approval_wait(pdMS_TO_TICKS(args->timeout_ms));
+    }
+    const char *reason = decision == MUSE_APPROVAL_APPROVED ? "approved"
+                         : decision == MUSE_APPROVAL_DENIED ? "denied"
+                         : decision == MUSE_APPROVAL_TIMED_OUT ? "timeout"
+                         : decision == MUSE_APPROVAL_NOT_DISPLAYED ? "not_displayed"
+                                                              : "cancelled";
+    cJSON *result = cJSON_CreateObject();
+    cJSON *payload = result ? cJSON_CreateObject() : NULL;
+    if (result && payload) {
+        cJSON_AddBoolToObject(result, "ok", true);
+        cJSON_AddBoolToObject(payload, "approved",
+                              decision == MUSE_APPROVAL_APPROVED);
+        cJSON_AddStringToObject(payload, "reason", reason);
+        cJSON_AddItemToObject(result, "payload", payload);
+    } else {
+        cJSON_Delete(payload);
+        cJSON_Delete(result);
+        result = command_error("out_of_memory", "failed to build approval result");
+    }
+    noise_ctrl_send_command_result(
+        args->session_generation, args->request_id, result);
+    free(args);
+    stack_monitor_record(NULL);
+    vTaskDelete(NULL);
+}
+
+static cJSON *approval_request_command(
+    cJSON *params, const char *request_id,
+    noise_ctrl_session_generation_t session_generation) {
+    cJSON *prompt = params ? cJSON_GetObjectItem(params, "prompt") : NULL;
+    cJSON *detail = params ? cJSON_GetObjectItem(params, "detail") : NULL;
+    cJSON *timeout = params ? cJSON_GetObjectItem(params, "timeout_s") : NULL;
+    if (!cJSON_IsString(prompt) || !prompt->valuestring || !prompt->valuestring[0]) {
+        return command_error("missing_param", "prompt is required");
+    }
+    size_t prompt_len = strlen(prompt->valuestring);
+    if (prompt_len > MUSE_APPROVAL_PROMPT_MAX) {
+        return command_error("invalid_params", "prompt is too long");
+    }
+    if (detail && !cJSON_IsString(detail)) {
+        return command_error("invalid_params", "detail must be a string");
+    }
+    const char *detail_text = cJSON_IsString(detail) && detail->valuestring
+                                  ? detail->valuestring : "";
+    if (strlen(detail_text) > MUSE_APPROVAL_DETAIL_MAX) {
+        return command_error("invalid_params", "detail is too long");
+    }
+    int timeout_s = 30;
+    if (timeout) {
+        if (!cJSON_IsNumber(timeout) || timeout->valuedouble != timeout->valueint
+            || timeout->valueint < 5 || timeout->valueint > 120) {
+            return command_error(
+                "invalid_params", "timeout_s must be an integer from 5 to 120");
+        }
+        timeout_s = timeout->valueint;
+    }
+    if (!muse_approval_begin(prompt->valuestring, detail_text)) {
+        return command_error("busy", "another approval request is active");
+    }
+    /* Wake before starting the timeout worker. The worker waits for the UI's
+     * visible acknowledgement, so time spent resuming a sleeping panel never
+     * consumes the user's decision window. */
+    muse_input_wake("approval request");
+    approval_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
+        muse_approval_cancel();
+        return command_error("out_of_memory", "failed to allocate approval request");
+    }
+    args->session_generation = session_generation;
+    args->timeout_ms = (uint32_t)timeout_s * 1000;
+    strlcpy(args->request_id, request_id, sizeof(args->request_id));
+    if (xTaskCreate(approval_task, "approval", 4096, args, 4, NULL) != pdPASS) {
+        free(args);
+        muse_approval_cancel();
+        return command_error("out_of_memory", "failed to start approval request");
+    }
+    cJSON *async = cJSON_CreateObject();
+    cJSON_AddBoolToObject(async, "_async", true);
+    return async;
+}
+#endif
+
 static char *json_strdup_string(cJSON *params, const char *key) {
     cJSON *item = params ? cJSON_GetObjectItem(params, key) : NULL;
     if (!cJSON_IsString(item) || !item->valuestring || !*item->valuestring) {
@@ -1846,6 +1951,11 @@ static cJSON *on_ws_command(
         if (!url) return command_error("missing_param", "url is required");
         return queue_ws_control(WS_CONTROL_SET_VM, url);
     }
+#if CONFIG_MUSE_ENABLED
+    if (strcmp(command, "approval.request") == 0) {
+        return approval_request_command(params, request_id, session_generation);
+    }
+#endif
 #if CONFIG_HOMEHUB_DISPLAY_COMMANDS
     if (strcmp(command, "display.draw_url") == 0) {
         cJSON *url = cJSON_GetObjectItem(params, "url");

@@ -38,6 +38,7 @@
 #include "muse_wifi.h"
 
 static const char *TAG = "muse_menu";
+static volatile bool s_close_requested;
 
 #define COLOR_TEXT 0xf2efff
 #define COLOR_DIM 0x8b84a8
@@ -598,6 +599,10 @@ bool muse_menu_tick(float now)
     if (!s_root) {
         return false;
     }
+    if (__atomic_exchange_n(&s_close_requested, false, __ATOMIC_RELAXED)) {
+        muse_menu_close();
+        return false;
+    }
     uint8_t k;
     while (xQueueReceive(s_keys, &k, 0) == pdTRUE) {
         s_last_key = now;
@@ -615,6 +620,12 @@ bool muse_menu_tick(float now)
         refresh();
     }
     return true;
+}
+
+void muse_menu_request_close(void)
+{
+    __atomic_store_n(&s_close_requested, true, __ATOMIC_RELAXED);
+    muse_state_nudge();
 }
 
 void muse_menu_close(void)

@@ -242,6 +242,14 @@ class PacingTest(unittest.TestCase):
         self.assertIn(lcd7.device, chat.ports.command_ports([lcd7]))
         self.assertFalse(chat.ports.paced(lcd7.device, [lcd7]))
 
+    def test_xiaozhi_uses_ch340k_for_chat_and_flash(self) -> None:
+        xiaozhi = SimpleNamespace(device="COM8", vid=0x1A86, pid=0x7522,
+                                  serial_number="3CDC75FC82A8")
+        self.assertEqual(chat.ports.find("xiaozhi-154", ports=[xiaozhi]), xiaozhi.device)
+        self.assertIn(xiaozhi.device, chat.ports.command_ports([xiaozhi]))
+        self.assertEqual(chat.ports.find("xiaozhi-154", "COM8", ports=[]), "COM8")
+        self.assertFalse(chat.ports.paced(xiaozhi.device, [xiaozhi]))
+
     def test_usbs_keeps_single_pairs_single(self) -> None:
         self.assertEqual(chat.ports._usbs(chat.ports.USJ), (chat.ports.USJ,))
         self.assertEqual(chat.ports._usbs(chat.ports.USB["core2"]), chat.ports.USB["core2"])

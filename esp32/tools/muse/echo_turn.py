@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reset a board, hold talk for 2.5 s over serial ('d'/'u'), print the log: tools/muse/echo_turn.py <port>
+"""Reset a board, hold talk for 2.5 s over serial, print the log: tools/muse/echo_turn.py <port>
 
 Look for "recorded 3.08s" and the Muse turn logs (with Muse not set up, the press just shows why).
 """
@@ -35,5 +35,5 @@ def rd(t):
 
 
 o = rd(6)
-s.write(b'd'); o += rd(2.5); s.write(b'u'); o += rd(10)
+s.write(b'>key=d\n'); o += rd(2.5); s.write(b'>key=u\n'); o += rd(10)
 sys.stdout.write(o)

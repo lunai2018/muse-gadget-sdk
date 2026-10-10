@@ -47,6 +47,7 @@ static SemaphoreHandle_t s_format_lock;
 static EventGroupHandle_t s_wake;
 static volatile int s_page_cols = 16, s_page_lines = 2;
 static volatile int s_cjk_cols, s_cjk_lines;
+static volatile int s_reply_page, s_reply_pages;
 static muse_power_t s_power = { .battery_pct = -1 };
 static volatile bool s_as_if_battery;
 
@@ -157,6 +158,22 @@ void muse_state_page(bool cjk, int *cols, int *lines)
     bool own = cjk && s_cjk_cols > 0;
     *cols = own ? s_cjk_cols : s_page_cols;
     *lines = own ? s_cjk_lines : s_page_lines;
+}
+
+void muse_state_set_reply_page(int page, int pages)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_reply_page = page;
+    s_reply_pages = pages;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+void muse_state_reply_page(int *page, int *pages)
+{
+    portENTER_CRITICAL(&s_lock);
+    *page = s_reply_page;
+    *pages = s_reply_pages;
+    portEXIT_CRITICAL(&s_lock);
 }
 
 void muse_state_set_power(const muse_power_t *power)

@@ -44,6 +44,15 @@ void muse_voice_request_loopback(void);
 /* Bench test: decodes and plays a built-in MP3 reply. */
 void muse_voice_request_mp3test(void);
 
+/* Wake the existing reply reader/player for a remote or serial text turn. */
+void muse_voice_request_text_reply(void);
+
+/* On a text-only reply page, the aux key can advance one screen or dismiss
+ * the reader without pretending to be a touch panel. Requests are consumed
+ * by the voice task, which owns the active Hatch turn. */
+void muse_voice_reply_next(void);
+void muse_voice_reply_dismiss(void);
+
 /* Asleep with nothing to play: codecs off, Wi-Fi dozing. */
 bool muse_voice_resting(void);
 

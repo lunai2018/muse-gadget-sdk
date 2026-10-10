@@ -34,6 +34,7 @@
 #include "muse_chat.h"
 #include "muse_input.h"
 #include "muse_mem.h"
+#include "muse_menu.h"
 #include "muse_settings.h"
 #include "muse_state.h"
 #include "muse_wifi.h"
@@ -73,6 +74,22 @@ static volatile float s_monitor_db = -100.0f;
 static volatile bool s_chirp;
 static volatile bool s_loopback;
 static volatile bool s_mp3test;
+static volatile bool s_text_reply;
+enum { REPLY_NAV_NEXT = 1, REPLY_NAV_DISMISS = 2 };
+static volatile unsigned s_reply_nav;
+
+/* Visible UTF-8 characters, rather than storage bytes. Newlines count as one
+ * small step; continuation bytes do not make Chinese read three times slower. */
+static size_t text_chars(const char *text)
+{
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if ((*p & 0xc0) != 0x80) {
+            n++;
+        }
+    }
+    return n;
+}
 
 /*
  * Pre-roll: while idle the mic keeps running into this ring, so a recording
@@ -166,13 +183,23 @@ static void idle_capture(void)
 }
 
 /* Non-blocking: returns true if an event of `type` arrived (others dropped). */
+static bool s_deferred_ptt_up;
+
 static bool got_event(muse_ptt_t type)
 {
     muse_input_event_t ev;
-    bool hit = false;
+    bool hit = type == MUSE_PTT_UP
+               && __atomic_exchange_n(&s_deferred_ptt_up, false, __ATOMIC_RELAXED);
     while (xQueueReceive(s_queue, &ev, 0) == pdTRUE) {
         muse_state_poke();
-        hit |= ev.type == type;
+        if (ev.type == type) {
+            hit = true;
+        } else if (type == MUSE_PTT_DOWN && ev.type == MUSE_PTT_UP) {
+            /* A quick barge-in can put DOWN and UP in the queue before the
+             * playback loop runs. Preserve that release for record();
+             * otherwise it records until MAX_SECS after the user let go. */
+            __atomic_store_n(&s_deferred_ptt_up, true, __ATOMIC_RELAXED);
+        }
     }
     return hit;
 }
@@ -248,6 +275,7 @@ static void take(rec_stats_t *st, const int16_t *pcm)
  */
 static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 {
+    muse_menu_request_close();
     muse_state_set_mode(MUSE_MODE_LISTENING);
     muse_state_set_progress(0);
     s_rec_n = s_sent = 0;
@@ -344,10 +372,12 @@ static void go_idle(const char *caption);
  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
  * true if interrupted by a new press. *delivered: the VM has the note.
  */
-static bool hatch_reply(bool *delivered)
+static bool hatch_reply(bool *delivered, bool voice_note)
 {
+    __atomic_store_n(&s_reply_nav, 0, __ATOMIC_RELAXED);
+    muse_menu_request_close();
     muse_state_set_mode(MUSE_MODE_THINKING);
-    muse_state_set_caption("SENDING VOICE NOTE");   /* until there's a transcript or reply */
+    muse_state_set_caption(voice_note ? "SENDING VOICE NOTE" : "PREPARING REPLY");
     static int16_t buf[MUSE_AUDIO_CHUNK];
     static const int16_t silence[MUSE_AUDIO_CHUNK];
     char text[96];
@@ -355,8 +385,35 @@ static bool hatch_reply(bool *delivered)
     bool done = false, speaking = false, replied = false;
     size_t played = 0;
     int64_t t0 = esp_timer_get_time();
+    int64_t reply_started_us = 0;
     *delivered = false;
+    /* A typed reply is already complete when it wakes this task.  Render its
+     * opening page directly instead of depending on a lossy event or the first
+     * Azure audio chunk. */
+    if (!voice_note && muse_hatch_turn_caption(0, page, sizeof(page))) {
+        replied = true;
+        muse_state_set_caption("%s", page);
+    }
     for (;;) {
+        unsigned nav = __atomic_exchange_n(&s_reply_nav, 0, __ATOMIC_RELAXED);
+        if (nav & REPLY_NAV_DISMISS) {
+            ESP_LOGI(TAG, "reply dismissed from the reader");
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            return false;
+        }
+        if (nav & REPLY_NAV_NEXT) {
+            /* One visible page at the text-only reading pace. The last line
+             * overlaps the next page, so advancing by the whole shown page
+             * reliably crosses exactly one page boundary. */
+            size_t chars = text_chars(page);
+            size_t skip = chars ? chars * MUSE_AUDIO_RATE / 16 : 10 * MUSE_AUDIO_RATE;
+            played += skip;
+            ESP_LOGI(TAG, "reply next page: +%.1fs", skip / (double)MUSE_AUDIO_RATE);
+            if (muse_hatch_turn_caption(played, page, sizeof(page))) {
+                muse_state_set_caption("%s", page);
+            }
+        }
         muse_hatch_ev_t ev;
         while ((ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
             switch (ev) {
@@ -373,6 +430,10 @@ static bool hatch_reply(bool *delivered)
                 break;
             case MUSE_HATCH_EV_REPLY:
                 replied = *delivered = true;
+                if (!reply_started_us) {
+                    reply_started_us = esp_timer_get_time();
+                }
+                muse_input_wake("Muse reply");
                 /* Once speech starts, the caption follows it. The event only
                  * has room for the page's start; the page itself comes below. */
                 if (!speaking && !muse_hatch_turn_caption(played, page, sizeof(page))) {
@@ -414,6 +475,16 @@ static bool hatch_reply(bool *delivered)
             muse_state_set_level(0);
             muse_audio_write(silence, MUSE_AUDIO_CHUNK);
         }
+        if (reply_started_us && !speaking && !done
+            && esp_timer_get_time() - reply_started_us > 15 * 1000000LL) {
+            /* Once reply text exists, Azure should start promptly.  Abort a
+             * broken TTS generation so late audio cannot leak into the next
+             * turn.  Time spent waiting for Muse to finish agent work is not
+             * part of this watchdog: a later reply must still wake the screen. */
+            ESP_LOGW(TAG, "reply audio did not start within 15s");
+            muse_hatch_turn_cancel();
+            done = true;
+        }
         /* The page being said, or before the speech the reply's opening page. */
         if ((speaking || replied) && muse_hatch_turn_caption(played, page, sizeof(page))) {
             muse_state_set_caption("%s", page);
@@ -432,6 +503,7 @@ static bool hatch_reply(bool *delivered)
 static void go_idle(const char *caption)
 {
     muse_state_set_progress(0);
+    muse_state_set_reply_page(0, 0);
     muse_state_set_mode(MUSE_MODE_IDLE);
     muse_state_set_caption("%s", caption);
 }
@@ -648,7 +720,7 @@ static bool send_held(bool quiet)
     if (fed == FED && quiet) {
         delivered = wait_delivered();
     } else if (fed == FED) {
-        interrupted = hatch_reply(&delivered);
+        interrupted = hatch_reply(&delivered, true);
     }
     if (fed != FED || quiet) {
         muse_hatch_turn_cancel();   /* asleep, the reply is left for the app */
@@ -735,7 +807,7 @@ static bool finish_note(void)
             }
         }
         if (fed) {
-            interrupted = hatch_reply(&delivered);
+            interrupted = hatch_reply(&delivered, true);
         }
         if (delivered || interrupted) {
             drop_rec();
@@ -747,7 +819,7 @@ static bool finish_note(void)
 #endif
     muse_hatch_turn_end();   /* before the chirp, which takes ~90 ms */
     muse_audio_chirp(0);
-    return hatch_reply(&delivered);
+    return hatch_reply(&delivered, true);
 }
 
 /*
@@ -843,6 +915,18 @@ static void voice_task(void *arg)
                 muse_audio_loopback_test(muse_settings_volume());
                 pre_reset();
             }
+            if (__atomic_exchange_n(&s_text_reply, false, __ATOMIC_RELAXED)) {
+                bool delivered = false;
+                pending_down = hatch_reply(&delivered, false);
+                pre_reset();
+                if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+                    muse_state_make_happy();
+                    go_idle("");
+                }
+                if (!pending_down) {
+                    continue;
+                }
+            }
             /* The 20 ms read paces this loop. */
             idle_capture();
             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
@@ -931,6 +1015,22 @@ void muse_voice_request_mp3test(void)
 {
     s_mp3test = true;
     muse_state_nudge();
+}
+
+void muse_voice_request_text_reply(void)
+{
+    __atomic_store_n(&s_text_reply, true, __ATOMIC_RELAXED);
+    muse_state_nudge();
+}
+
+void muse_voice_reply_next(void)
+{
+    __atomic_fetch_or(&s_reply_nav, REPLY_NAV_NEXT, __ATOMIC_RELAXED);
+}
+
+void muse_voice_reply_dismiss(void)
+{
+    __atomic_fetch_or(&s_reply_nav, REPLY_NAV_DISMISS, __ATOMIC_RELAXED);
 }
 
 bool muse_voice_resting(void)

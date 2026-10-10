@@ -78,6 +78,16 @@ class CaptionWrapTest(unittest.TestCase):
         )
         return proc.stdout.decode().split("\n")
 
+    def page(self, text: str, cols: int, lines: int, at: int) -> tuple[str, list[str]]:
+        proc = subprocess.run(
+            [str(self.binary), "caption-page", str(cols), str(lines), str(at)],
+            input=text.encode(),
+            capture_output=True,
+            check=True,
+        )
+        marker, *body = proc.stdout.decode().split("\n")
+        return marker, body
+
     def test_words_stay_whole(self) -> None:
         self.assertEqual(self.wrap("the quick brown fox jumps", 10), ["the quick", "brown fox", "jumps"])
 
@@ -112,6 +122,12 @@ class CaptionWrapTest(unittest.TestCase):
 
     def test_mixed_text_breaks_at_spaces_or_between_cjk(self) -> None:
         self.assertEqual(self.wrap("Muse 说 hello world", 8), ["Muse 说", "hello", "world"])
+
+    def test_overlapping_pages_report_current_and_total(self) -> None:
+        text = "aaaa bbbb cccc dddd eeee ffff"
+        self.assertEqual(self.page(text, 5, 3, 0), ("1/3", ["aaaa", "bbbb", "cccc"]))
+        self.assertEqual(self.page(text, 5, 3, 10), ("2/3", ["cccc", "dddd", "eeee"]))
+        self.assertEqual(self.page(text, 5, 3, 25), ("3/3", ["eeee", "ffff"]))
 
 
 if __name__ == "__main__":

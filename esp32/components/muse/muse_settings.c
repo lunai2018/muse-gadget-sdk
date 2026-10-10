@@ -44,6 +44,9 @@ static struct {
     char host[MUSE_HOST_MAX + 1];
     char vm[MUSE_VM_MAX + 1];
     char token[MUSE_TOKEN_MAX + 1];
+    char tts_key[MUSE_TTS_KEY_MAX + 1];
+    char tts_region[MUSE_TTS_REGION_MAX + 1];
+    char tts_voice[MUSE_TTS_VOICE_MAX + 1];
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
@@ -52,6 +55,8 @@ static struct {
     .sleep_s = 120,
     .wifi_on = true,
     .host = DEFAULT_HOST,
+    .tts_region = "eastus",
+    .tts_voice = "en-US-AvaNeural",
 };
 
 static SemaphoreHandle_t s_lock;
@@ -87,6 +92,27 @@ static void save_str(const char *key, const char *v)
 {
     nvs_set_str(s_nvs, key, v);
     nvs_commit(s_nvs);
+}
+
+/* Store a security-sensitive string and prove that the committed value can be
+ * read back. Never log the value itself. The caller holds s_lock. */
+static esp_err_t save_str_verified(const char *key, const char *v, char *check, size_t check_len)
+{
+    esp_err_t err = nvs_set_str(s_nvs, key, v);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs);
+    }
+    if (err == ESP_OK) {
+        size_t n = check_len;
+        err = nvs_get_str(s_nvs, key, check, &n);
+    }
+    if (err == ESP_OK && strcmp(check, v) != 0) {
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to persist %s: %s", key, esp_err_to_name(err));
+    }
+    return err;
 }
 
 static void notify(muse_setting_t what)
@@ -132,13 +158,17 @@ esp_err_t muse_settings_init(void)
     load_str("host", s.host, sizeof(s.host));
     load_str("vm", s.vm, sizeof(s.vm));
     load_str("token", s.token, sizeof(s.token));
+    load_str("tts_key", s.tts_key, sizeof(s.tts_key));
+    load_str("tts_region", s.tts_region, sizeof(s.tts_region));
+    load_str("tts_voice", s.tts_voice, sizeof(s.tts_voice));
 
     s.volume = clampi(s.volume, 0, 100);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
-    ESP_LOGI(TAG, "vol %d%s, mic %d dB, bright %d, sleep %ds, wifi %s (%s), ble %s, muse %s",
+    ESP_LOGI(TAG, "vol %d%s, mic %d dB, bright %d, sleep %ds, wifi %s (%s), ble %s, muse %s, Azure TTS %s",
              s.volume, s.speaker_on ? "" : " (speaker off)", s.mic_gain, s.brightness, s.sleep_s, s.wifi_on ? "on" : "off",
-             "network saved by Link", s.ble_on ? "on" : "off", s.token[0] ? "token set" : "no token");
+             "network saved by Link", s.ble_on ? "on" : "off", s.token[0] ? "token set" : "no token",
+             s.tts_key[0] ? "configured" : "not configured");
     return ESP_OK;
 }
 
@@ -189,6 +219,50 @@ size_t muse_settings_hatch_token_len(void)
     size_t n;
     LOCKED(n = strlen(s.token));
     return n;
+}
+
+void muse_settings_azure_tts_key(char out[MUSE_TTS_KEY_MAX + 1])
+{
+    LOCKED(strlcpy(out, s.tts_key, MUSE_TTS_KEY_MAX + 1));
+}
+
+void muse_settings_azure_tts_region(char out[MUSE_TTS_REGION_MAX + 1])
+{
+    LOCKED(strlcpy(out, s.tts_region, MUSE_TTS_REGION_MAX + 1));
+}
+
+void muse_settings_azure_tts_voice(char out[MUSE_TTS_VOICE_MAX + 1])
+{
+    LOCKED(strlcpy(out, s.tts_voice, MUSE_TTS_VOICE_MAX + 1));
+}
+
+bool muse_settings_azure_tts_configured(void)
+{
+    bool configured;
+    LOCKED(configured = s.tts_key[0] && s.tts_region[0] && s.tts_voice[0]);
+    return configured;
+}
+
+bool muse_settings_azure_tts_persisted(void)
+{
+    bool persisted = false;
+    char key[MUSE_TTS_KEY_MAX + 1] = {0};
+    char region[MUSE_TTS_REGION_MAX + 1] = {0};
+    char voice[MUSE_TTS_VOICE_MAX + 1] = {0};
+    LOCKED({
+        size_t key_len = sizeof(key);
+        size_t region_len = sizeof(region);
+        size_t voice_len = sizeof(voice);
+        persisted = s.tts_key[0] && s.tts_region[0] && s.tts_voice[0]
+            && nvs_get_str(s_nvs, "tts_key", key, &key_len) == ESP_OK
+            && nvs_get_str(s_nvs, "tts_region", region, &region_len) == ESP_OK
+            && nvs_get_str(s_nvs, "tts_voice", voice, &voice_len) == ESP_OK
+            && strcmp(key, s.tts_key) == 0
+            && strcmp(region, s.tts_region) == 0
+            && strcmp(voice, s.tts_voice) == 0;
+    });
+    memset(key, 0, sizeof(key));
+    return persisted;
 }
 
 void muse_settings_set_volume(int pct)
@@ -293,5 +367,56 @@ esp_err_t muse_settings_set_hatch_token(const char *token, bool append)
     if (err == ESP_OK) {
         notify(MUSE_SETTING_HATCH);
     }
+    return err;
+}
+
+esp_err_t muse_settings_set_azure_tts_key(const char *key)
+{
+    esp_err_t err = ESP_OK;
+    char staged[MUSE_TTS_KEY_MAX + 1];
+    char check[MUSE_TTS_KEY_MAX + 1] = {0};
+    key = key ? key : "";
+    if (strlen(key) > MUSE_TTS_KEY_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    strlcpy(staged, key, sizeof(staged));
+    LOCKED({
+        err = save_str_verified("tts_key", staged, check, sizeof(check));
+        if (err == ESP_OK) {
+            strlcpy(s.tts_key, staged, sizeof(s.tts_key));
+        }
+    });
+    memset(staged, 0, sizeof(staged));
+    memset(check, 0, sizeof(check));
+    return err;
+}
+
+esp_err_t muse_settings_set_azure_tts_region(const char *region)
+{
+    esp_err_t err = ESP_OK;
+    char staged[MUSE_TTS_REGION_MAX + 1];
+    char check[MUSE_TTS_REGION_MAX + 1] = {0};
+    strlcpy(staged, region && region[0] ? region : "eastus", sizeof(staged));
+    LOCKED({
+        err = save_str_verified("tts_region", staged, check, sizeof(check));
+        if (err == ESP_OK) {
+            strlcpy(s.tts_region, staged, sizeof(s.tts_region));
+        }
+    });
+    return err;
+}
+
+esp_err_t muse_settings_set_azure_tts_voice(const char *voice)
+{
+    esp_err_t err = ESP_OK;
+    char staged[MUSE_TTS_VOICE_MAX + 1];
+    char check[MUSE_TTS_VOICE_MAX + 1] = {0};
+    strlcpy(staged, voice && voice[0] ? voice : "en-US-AvaNeural", sizeof(staged));
+    LOCKED({
+        err = save_str_verified("tts_voice", staged, check, sizeof(check));
+        if (err == ESP_OK) {
+            strlcpy(s.tts_voice, staged, sizeof(s.tts_voice));
+        }
+    });
     return err;
 }

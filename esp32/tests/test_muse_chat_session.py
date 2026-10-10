@@ -20,7 +20,7 @@ class ChatSession(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         out = Path(cls.tmp.name)
-        source = (ROOT / 'components/muse/muse_chat_session.cpp').read_text()
+        source = (ROOT / 'components/muse/muse_chat_session.cpp').read_text(encoding='utf-8')
         constants = source[source.index('#define MIC_RATE'):source.index('/* ---- Voice task')]
         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
         handlers = source[source.index('static int find_msg('):source.index('static void on_chat_ack(')]
@@ -42,6 +42,8 @@ static turn_t s_turn;
 static char s_reply_shown[EV_TEXT];
 static int64_t s_last_seq, s_marks[4];
 static int captions, console_events;
+static int playback_requests;
+static int wake_requests;
 enum mark_t { M_TEXT, M_DONE };
 static void mark(mark_t) {}
 static int64_t now_us() { return 12345; }
@@ -49,6 +51,8 @@ static void emit(muse_hatch_ev_t type, const char *) {
     if (type == MUSE_HATCH_EV_REPLY) captions++;
 }
 void muse_hatch_console(const char *, const char *, const char *, ...) { console_events++; }
+void muse_input_wake(const char *) { wake_requests++; }
+void muse_voice_request_text_reply() { playback_requests++; }
 void muse_hatch_tail_words(const char *text, char *out, size_t cap) { strlcpy(out, text, cap); }
 bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
     strlcpy(out, text, cap); return text[0];
@@ -65,7 +69,7 @@ static void begin(bool typed = false) {
     s_turn.acked = true;
     strlcpy(s_turn.user_ids[0], "note", sizeof(s_turn.user_ids[0]));
     strlcpy(s_turn.user_ids[1], "parent", sizeof(s_turn.user_ids[1]));
-    captions = console_events = 0;
+    captions = console_events = playback_requests = wake_requests = 0;
 }
 static void event(const char *kind, const char *id, const char *parent = "", const char *text = "") {
     cJSON *root = cJSON_CreateObject(), *payload = cJSON_CreateObject();
@@ -92,7 +96,10 @@ static void rejected_deltas() {
         event("delta.text_append", "reply", "", "Our reply");
         event("delta.message_done", "reply");
         assert(s_turn.nmsgs == 1 && s_turn.msgs[0].done && s_turn.msgs[0].len == 9);
+        assert(s_turn.msgs[0].tts == TTS_QUEUED);
         assert(typed ? console_events == 2 : captions == 1);
+        assert(playback_requests == (typed ? 1 : 0));
+        assert(wake_requests == (typed ? 1 : 0));
         begin(typed);
         event("message.assistant", "other", "", "New turn");
         assert(s_turn.nmsgs == 1 && s_turn.msgs[0].done);

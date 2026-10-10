@@ -31,6 +31,8 @@ USJ = (0x303A, 0x1001)      # the chip's own USB Serial/JTAG
 CH342 = (0x1A86, 0x55D2)    # WCH dual UART bridge: two ports per device
 CH9102 = (0x1A86, 0x55D4)   # WCH single UART bridge
 CH343 = (0x1A86, 0x55D3)    # WCH single UART bridge on Waveshare 7-inch LCD
+CH340K = (0x1A86, 0x7522)   # WCH CH340K bridge on the tested Xiaozhi board
+CH340 = (0x1A86, 0x7523)    # Other WCH CH340/CH341 revisions
 CP210X = (0x10C4, 0xEA60)   # Silicon Labs CP2104 bridge
 
 
@@ -48,6 +50,7 @@ USB = {
     "s3": USJ,
     "s3n": USJ,
     "aipi": USJ,
+    "xiaozhi-154": (CH340K, CH340),
     "box3": USJ,
     "c6": USJ,
     "sticks3": USJ,
@@ -63,11 +66,12 @@ USB = {
 }
 # Boards whose console takes Muse's serial commands (tools/muse/chat.py). The
 # Watcher reads them on its CH342 port with MUSE_CONSOLE_UART.
-COMMANDS = ("s3", "s3n", "aipi", "box3", "c6", "sticks3", "watcher", "plus2", "cardputer-adv", "stopwatch", "cores3", "core2", "fnk0104b", "jc3248w535", "lcd7")
+COMMANDS = ("s3", "s3n", "aipi", "xiaozhi-154", "box3", "c6", "sticks3", "watcher", "plus2", "cardputer-adv", "stopwatch", "cores3", "core2", "fnk0104b", "jc3248w535", "lcd7")
 # Bridges that drop bytes when a whole packet arrives at once, so writes to them
 # go 64 bytes at a time at the line rate (paced_esptool.py, chat.Board.write).
 PACED = (CH342,)
 KINDS = {USJ: "Espressif USB Serial/JTAG", CH342: "CH342 bridge", CH9102: "CH9102 bridge", CH343: "CH343 bridge",
+         CH340K: "CH340K bridge", CH340: "CH340 bridge",
          CP210X: "CP2104 bridge"}
 
 
@@ -93,7 +97,7 @@ def devices(usb, ports=None):
 
 def find(board, serial=None, ports=None):
     """BOARD's port, or NotFound. SERIAL picks one of several (or is a port)."""
-    if serial and serial.startswith("/dev/"):
+    if serial and (serial.startswith("/dev/") or serial.upper().startswith("COM")):
         return serial
     usb = USB[board]
     cands = devices(usb, ports)

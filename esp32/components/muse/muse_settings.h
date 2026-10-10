@@ -22,6 +22,10 @@
 
 #include "esp_err.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * User settings, persisted in NVS. Setters save immediately and then notify the
  * change listener (from the caller's task), which applies the setting to the
@@ -33,6 +37,9 @@
 #define MUSE_HOST_MAX 63
 #define MUSE_VM_MAX 63
 #define MUSE_TOKEN_MAX 1023
+#define MUSE_TTS_KEY_MAX 128
+#define MUSE_TTS_REGION_MAX 31
+#define MUSE_TTS_VOICE_MAX 63
 
 #define MUSE_MIC_GAIN_MAX 36      /* dB; ES7210 PGA, applied in 3 dB steps */
 
@@ -65,6 +72,12 @@ void muse_settings_hatch_host(char out[MUSE_HOST_MAX + 1]);
 void muse_settings_hatch_vm(char out[MUSE_VM_MAX + 1]);
 void muse_settings_hatch_token(char out[MUSE_TOKEN_MAX + 1]);
 size_t muse_settings_hatch_token_len(void);
+void muse_settings_azure_tts_key(char out[MUSE_TTS_KEY_MAX + 1]);
+void muse_settings_azure_tts_region(char out[MUSE_TTS_REGION_MAX + 1]);
+void muse_settings_azure_tts_voice(char out[MUSE_TTS_VOICE_MAX + 1]);
+bool muse_settings_azure_tts_configured(void);
+/* True only when the active Azure settings exactly match committed NVS data. */
+bool muse_settings_azure_tts_persisted(void);
 
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);
@@ -80,3 +93,10 @@ void muse_settings_set_hatch_host(const char *host);
 void muse_settings_set_hatch_vm(const char *vm);
 /* append=true adds to the stored token (for chunked BLE writes). */
 esp_err_t muse_settings_set_hatch_token(const char *token, bool append);
+esp_err_t muse_settings_set_azure_tts_key(const char *key);
+esp_err_t muse_settings_set_azure_tts_region(const char *region);
+esp_err_t muse_settings_set_azure_tts_voice(const char *voice);
+
+#ifdef __cplusplus
+}
+#endif

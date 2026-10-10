@@ -46,5 +46,8 @@ typedef struct {
 /* PTT events are posted to `queue` (items are muse_input_event_t). */
 esp_err_t muse_input_start(QueueHandle_t queue);
 
+/* Wake the display for an asynchronous result and reset its sleep timer. */
+void muse_input_wake(const char *why);
+
 /* Plays the goodbye animation and powers off (from the input task). */
 void muse_input_request_power_off(void);

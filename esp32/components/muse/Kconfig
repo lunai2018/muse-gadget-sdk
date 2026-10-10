@@ -39,6 +39,10 @@ menu "Muse"
             bool "AIPI Lite (ESP32-S3, two buttons, no touch)"
             depends on IDF_TARGET_ESP32S3
 
+        config MUSE_BOARD_XIAOZHI_154
+            bool "Xiaozhi 1.54 (ESP32-S3, 240x240 LCD, two buttons, no touch)"
+            depends on IDF_TARGET_ESP32S3
+
         config MUSE_BOARD_ESPRESSIF_BOX_3
             bool "Espressif ESP32-S3-BOX-3 (320x240 touch LCD, speaker and microphones)"
             depends on IDF_TARGET_ESP32S3
@@ -97,6 +101,7 @@ menu "Muse"
         default "waveshare_s3_175c" if MUSE_BOARD_WAVESHARE_S3_175C
         default "waveshare_s3_175" if MUSE_BOARD_WAVESHARE_S3_175
         default "aipi" if MUSE_BOARD_AIPI
+        default "xiaozhi_154" if MUSE_BOARD_XIAOZHI_154
         default "espressif_box_3" if MUSE_BOARD_ESPRESSIF_BOX_3
         default "waveshare_c6_18" if MUSE_BOARD_WAVESHARE_C6_18
         default "sensecap_watcher" if MUSE_BOARD_SENSECAP_WATCHER
@@ -116,7 +121,7 @@ menu "Muse"
     # (the Watcher's USB-C goes to a CH342) or the chip has none.
     config MUSE_CONSOLE_UART
         bool
-        default y if MUSE_BOARD_SENSECAP_WATCHER || MUSE_BOARD_WAVESHARE_S3_LCD7 || !SOC_USB_SERIAL_JTAG_SUPPORTED
+        default y if MUSE_BOARD_SENSECAP_WATCHER || MUSE_BOARD_XIAOZHI_154 || MUSE_BOARD_WAVESHARE_S3_LCD7 || !SOC_USB_SERIAL_JTAG_SUPPORTED
 
     # A board overlay can raise this for a quiet speaker.
     config MUSE_DEFAULT_VOLUME

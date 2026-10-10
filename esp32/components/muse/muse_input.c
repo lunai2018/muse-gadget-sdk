@@ -31,6 +31,7 @@
 #endif
 
 #include "muse_battery.h"
+#include "muse_approval.h"
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_chat.h"
@@ -57,6 +58,7 @@ static const char *TAG = "muse_input";
 #define REST_POWER_MS 10000    /* ... while paused */
 #define WIFI_NAP_MS (2 * 60 * 1000)   /* low power this long: Wi-Fi off until it ends */
 #define DOUBLE_TICKS 35        /* 350 ms: a second aux press within this toggles phone setup */
+#define MENU_BACK_TICKS 60     /* 600 ms: hold aux to leave the two-button menu */
 
 #define GOODBYE_MS 1500        /* let the goodbye animation play */
 #define HINT_TICKS 60          /* 0.6 s: warn that holding powers off */
@@ -183,14 +185,55 @@ static void aux_button(bool pressed, bool edge)
 /* No touch: the aux button opens the menu and steps down it; any press wakes. */
 static void menu_button(bool pressed, bool edge)
 {
-    if (!edge || !pressed) {
+    static int held;
+    static bool swallow;
+    static bool reply_key;
+    if (edge && pressed) {
+        held = 0;
+        swallow = false;
+        reply_key = false;
+        if (muse_state_asleep()) {
+            set_asleep(false, muse_board->aux_button);
+            swallow = true;
+        } else if (!s_talk_down) {
+            muse_state_poke();
+            muse_mode_t mode = muse_state_mode(NULL);
+            if (mode == MUSE_MODE_SPEAKING) {
+                /* In the full-screen reader this key belongs to the reply,
+                 * not the settings menu. Release advances; a hold exits. */
+                reply_key = true;
+            } else if (mode == MUSE_MODE_IDLE) {
+                muse_menu_key(MUSE_MENU_DOWN);
+            } else {
+                /* A voice turn owns the UI from recording through reply.
+                 * Ignore an aux edge here so key overlap cannot replace the
+                 * conversation with the settings menu. */
+                swallow = true;
+                ESP_LOGW(TAG, "aux key ignored during voice turn (mode %d)", mode);
+            }
+        }
         return;
     }
-    if (muse_state_asleep()) {
-        set_asleep(false, muse_board->aux_button);
-    } else if (!s_talk_down) {
+    if (pressed && !swallow && !s_talk_down && muse_menu_is_open()
+        && ++held == MENU_BACK_TICKS) {
         muse_state_poke();
-        muse_menu_key(MUSE_MENU_DOWN);
+        muse_menu_key(MUSE_MENU_BACK);
+        swallow = true;
+    }
+    if (pressed && reply_key && !swallow && !s_talk_down
+        && ++held == MENU_BACK_TICKS) {
+        muse_state_poke();
+        muse_voice_reply_dismiss();
+        swallow = true;
+    }
+    if (edge && !pressed) {
+        if (reply_key && !swallow) {
+            muse_state_poke();
+            muse_voice_reply_next();
+        }
+        held = 0;
+        swallow = false;
+        reply_key = false;
     }
 }
 
@@ -247,8 +290,17 @@ static void talk_button(unsigned ev)
             talk_down = true;
         } else if (muse_menu_is_open()) {
             muse_state_poke();
-            if (!muse_board->keyboard) muse_menu_key(MUSE_MENU_SELECT);
-            swallow = true;
+            if (muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+                /* A reply may have arrived just after an aux edge opened the
+                 * menu. Recover Talk as PTT instead of selecting a stale
+                 * menu item. */
+                muse_menu_request_close();
+                post(MUSE_PTT_DOWN, false);
+                talk_down = true;
+            } else {
+                if (!muse_board->keyboard) muse_menu_key(MUSE_MENU_SELECT);
+                swallow = true;
+            }
         } else {
             post(MUSE_PTT_DOWN, false);
             talk_down = true;
@@ -297,15 +349,17 @@ static void check_sleep(void)
 {
     muse_ble_status_t ble;
     muse_ble_status(&ble);
-    bool prompt = ble.passkey || muse_link_state() == MUSE_LINK_CONFIRM;
+    bool prompt = ble.passkey || muse_link_state() == MUSE_LINK_CONFIRM
+                  || muse_approval_active();
     if (prompt) {
         set_asleep(false, "pairing");
         return;
     }
     int after = muse_settings_sleep_s();
     float mode_t;
-    if (after && !muse_state_asleep() && muse_state_mode(&mode_t) == MUSE_MODE_IDLE
-        && muse_state_idle_secs() > after) {
+    muse_mode_t mode = muse_state_mode(&mode_t);
+    bool may_sleep = mode == MUSE_MODE_IDLE || mode == MUSE_MODE_THINKING;
+    if (after && !muse_state_asleep() && may_sleep && muse_state_idle_secs() > after) {
         set_asleep(true, "auto-sleep");
     }
 }
@@ -393,12 +447,49 @@ static void input_task(void *arg)
 {
     (void)arg;
     bool aux_down = false;
+    bool approval_talk_swallow = false;
+    bool approval_aux_swallow = false;
     bool paused = false;
     TickType_t checked = xTaskGetTickCount() - pdMS_TO_TICKS(SLEEP_CHECK_MS);
     TickType_t powered = xTaskGetTickCount() - pdMS_TO_TICKS(POWER_MS);
 
     for (;;) {
         unsigned ev = muse_board->poll_buttons();
+        unsigned raw_ev = ev;
+
+        /* A confirmation card owns both physical buttons. Keep the release
+         * that follows a decision out of the normal PTT/menu handlers too. */
+        if (muse_approval_visible()) {
+            bool decided = false;
+            if (raw_ev & MUSE_BTN_TALK_PRESS) {
+                decided = muse_approval_respond(true);
+                approval_talk_swallow = true;
+                ESP_LOGI(TAG, "approval: approved");
+            } else if (raw_ev & MUSE_BTN_AUX_PRESS) {
+                decided = muse_approval_respond(false);
+                approval_aux_swallow = true;
+                ESP_LOGI(TAG, "approval: denied");
+            } else if (raw_ev & MUSE_BTN_ENTER) {
+                decided = muse_approval_respond(true);
+                ESP_LOGI(TAG, "approval: approved by keyboard");
+            } else if (raw_ev & MUSE_BTN_ESCAPE) {
+                decided = muse_approval_respond(false);
+                ESP_LOGI(TAG, "approval: denied by keyboard");
+            }
+            if (decided) muse_state_poke();
+            ev &= ~(MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE |
+                    MUSE_BTN_AUX_PRESS | MUSE_BTN_AUX_RELEASE |
+                    MUSE_BTN_UP | MUSE_BTN_DOWN | MUSE_BTN_LEFT |
+                    MUSE_BTN_RIGHT | MUSE_BTN_ENTER | MUSE_BTN_ESCAPE);
+        }
+        if (approval_talk_swallow) {
+            ev &= ~(MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE);
+            if (raw_ev & MUSE_BTN_TALK_RELEASE) approval_talk_swallow = false;
+        }
+        if (approval_aux_swallow) {
+            ev &= ~(MUSE_BTN_AUX_PRESS | MUSE_BTN_AUX_RELEASE);
+            if (raw_ev & MUSE_BTN_AUX_RELEASE) approval_aux_swallow = false;
+        }
         if (ev & (MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE)) {
             ESP_LOGI(TAG, "talk key:%s%s", ev & MUSE_BTN_TALK_PRESS ? " press" : "",
                      ev & MUSE_BTN_TALK_RELEASE ? " release" : "");
@@ -564,12 +655,39 @@ static void set_face(const char *name)
     fflush(stdout);
 }
 
+/* Bench keys are framed as >key=X.  They must never be accepted as bare
+ * bytes: if a USB-UART reset drops the leading '>', ordinary command text
+ * such as "status" or "chat=..." contains a/s/d/u and would otherwise drive
+ * the menu or synthesize talk-button events. */
+static bool bench_key(char c)
+{
+    if (c == 'm') {
+        muse_voice_request_mp3test();
+    } else if (c == 'a' || c == 's') {
+        muse_state_poke();
+        muse_menu_key(c == 'a' ? MUSE_MENU_DOWN : MUSE_MENU_SELECT);
+    } else if (c == 'p') {
+        muse_ui_request_snapshot();
+    } else if (c == 'z' || c == 'w') {
+        set_asleep(c == 'z', "serial");
+    } else if (c == 'd' || c == 'u') {
+        muse_state_poke();
+        post(c == 'd' ? MUSE_PTT_DOWN : MUSE_PTT_UP, false);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 /*
  * Console-only commands; false for setup commands. Their buffers are taken
  * per command: without PSRAM, static ones would hold internal RAM for good.
  */
 static bool console_command(char *line, bool whole)
 {
+    if (!strncmp(line, "key=", 4) && line[4] && !line[5]) {
+        return bench_key(line[4]);
+    }
     if (!strcmp(line, "status")) {
         size_t cap = 1024;   /* long SSID, host and VM names escaped: past 512 */
         char *json = heap_caps_malloc(cap, MUSE_BIG_CAPS);
@@ -633,10 +751,12 @@ static bool console_command(char *line, bool whole)
 }
 
 /*
- * Bench testing over the USB cable: 'd' / 'u' act as the talk button going
+ * Bench testing over the USB cable: '>key=d' / '>key=u' act as the talk button going
  * down / up, so the voice path can be driven without a finger on the button;
- * 'm' plays a built-in MP3 through the reply decoder; 'a' / 's' press the
- * menu's Down / Select; 'p' sends a screenshot; 'z' / 'w' sleep and wake.
+ * '>key=m' plays a built-in MP3 through the reply decoder; '>key=a' / '>key=s'
+ * press the menu's Down / Select; '>key=p' sends a screenshot; '>key=z' /
+ * '>key=w' sleep and wake. Framing prevents a dropped command prefix from
+ * turning ordinary text into accidental physical-button events.
  * A line starting with '>' is a setup command, the same "key=value" text as
  * the BLE CMD characteristic, or one of the console's own: "status" prints
  * the device's state, "power" the battery meter (muse_battery.h) and
@@ -647,7 +767,9 @@ static bool console_command(char *line, bool whole)
  */
 static void serial_task(void *arg)
 {
-    if (muse_console_install(SERIAL_RX) != ESP_OK) {
+    esp_err_t err = muse_console_install(SERIAL_RX);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "console input init failed: %s", esp_err_to_name(err));
         vTaskDelete(NULL);
     }
     for (;;) {
@@ -655,16 +777,7 @@ static void serial_task(void *arg)
         if (!muse_console_getc(&c)) {
             continue;
         }
-        if (c == 'm') {
-            muse_voice_request_mp3test();
-        } else if (c == 'a' || c == 's') {
-            muse_state_poke();
-            muse_menu_key(c == 'a' ? MUSE_MENU_DOWN : MUSE_MENU_SELECT);
-        } else if (c == 'p') {
-            muse_ui_request_snapshot();
-        } else if (c == 'z' || c == 'w') {
-            set_asleep(c == 'z', "serial");
-        } else if (c == '>') {
+        if (c == '>') {
             char *line = heap_caps_malloc(SERIAL_LINE, MUSE_BIG_CAPS);
             char none[1];   /* no room: the line is read and dropped */
             bool whole = read_line(line ? line : none, line ? SERIAL_LINE : sizeof(none));
@@ -672,9 +785,6 @@ static void serial_task(void *arg)
                 muse_ble_command(line);
             }
             free(line);
-        } else if (c == 'd' || c == 'u') {
-            muse_state_poke();
-            post(c == 'd' ? MUSE_PTT_DOWN : MUSE_PTT_UP, false);
         }
     }
 }
@@ -693,4 +803,15 @@ esp_err_t muse_input_start(QueueHandle_t queue)
 void muse_input_request_power_off(void)
 {
     s_power_off_requested = true;
+}
+
+void muse_input_wake(const char *why)
+{
+    ESP_LOGI(TAG, "wake request (%s): asleep=%d dark=%d",
+             why ? why : "event", muse_state_asleep(), muse_ui_dark());
+    if (muse_state_asleep()) {
+        set_asleep(false, why ? why : "event");
+    } else {
+        muse_state_poke();
+    }
 }

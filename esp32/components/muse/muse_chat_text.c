@@ -164,9 +164,19 @@ bool muse_hatch_caption_at(const char *text, size_t at, char *out, size_t cap)
         }
     }
     if (line < 0) {
+        muse_state_set_reply_page(0, 0);
         return false;
     }
-    int first = lines > 1 ? line / (lines - 1) * (lines - 1) : line;
+    int step = lines > 1 ? lines - 1 : 1;
+    int first = line / step * step;
+
+    int total_lines = 0;
+    p = text;
+    while (next_line(&p, cols, &start, &len)) {
+        total_lines++;
+    }
+    int pages = total_lines <= lines ? 1 : 1 + (total_lines - lines + step - 1) / step;
+    muse_state_set_reply_page(first / step + 1, pages);
 
     size_t o = 0;
     out[0] = '\0';

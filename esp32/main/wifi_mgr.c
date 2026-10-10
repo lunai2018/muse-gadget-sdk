@@ -29,6 +29,8 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
 
 static const char *TAG = "link.wifi";
 
@@ -52,6 +54,7 @@ static bool s_connecting = false;        // true during initial wifi_mgr_connect
 static portMUX_TYPE s_join_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_join_ssid[33];
 static bool s_keep_connected = false;    // true once we've ever had a successful association
+static bool s_recovering = false;        // post-association drop awaiting a fresh lease
 static atomic_bool s_connect_pending = ATOMIC_VAR_INIT(false);
 // Not joined or joining: nothing for wifi_mgr_connect() to tear down first.
 static atomic_bool s_sta_idle = ATOMIC_VAR_INIT(true);
@@ -181,6 +184,7 @@ static void event_handler(void *arg, esp_event_base_t base,
             }
         } else if (s_keep_connected) {
             // Post-association drop. Reconnect forever with exponential backoff.
+            s_recovering = true;
             ESP_LOGW(TAG, "wifi disconnected post-association, scheduling reconnect");
             schedule_reconnect();
         }
@@ -190,6 +194,18 @@ static void event_handler(void *arg, esp_event_base_t base,
         s_retry = 0;
         s_keep_connected = true;
         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;  // reset on success
+        if (s_recovering) {
+            /* A resolver request made while the AP was absent can remain in
+             * lwIP's DNS table after DHCP succeeds. It then keeps the Muse
+             * session in getaddrinfo failures until that stale entry expires.
+             * Cancel those old requests so the next attempt uses the DNS
+             * server from the new lease immediately. */
+            LOCK_TCPIP_CORE();
+            dns_clear_cache();
+            UNLOCK_TCPIP_CORE();
+            s_recovering = false;
+            ESP_LOGI(TAG, "network restored; cleared stale DNS requests");
+        }
         xEventGroupSetBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
     }
 }

@@ -15,6 +15,14 @@ __pycache__/
 *.pyo
 .venv/
 build/
+.pytest_cache/
+.test-tmp/
+
+# ESP-IDF generated state
+/esp32/.cache/
+/esp32/.pytest_cache/
+/esp32/build-*/
+/esp32/managed_components/
 
 # Claude Code
 .claude/
@@ -24,3 +32,6 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+
+# Downloaded read-only vendor reference used during the Xiaozhi port.
+/vendor-source/

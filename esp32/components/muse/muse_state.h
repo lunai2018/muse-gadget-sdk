@@ -57,7 +57,10 @@ void muse_state_set_progress(float progress);
 float muse_state_progress(void);
 
 /* Room for a page of reply text; longer captions are cut short. */
-#define MUSE_CAPTION_MAX 400
+/* A 240x240 CJK reading page can hold eleven rows of fourteen UTF-8 glyphs.
+ * Keep the whole page, including newlines, so its last rows are not dropped
+ * merely because Chinese uses three bytes per glyph. */
+#define MUSE_CAPTION_MAX 512
 
 void muse_state_set_caption(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* Copies the caption if it changed since *version; returns true on change. */
@@ -70,6 +73,8 @@ bool muse_state_caption(char *out, size_t out_len, uint32_t *version);
 void muse_state_set_page(int cols, int lines);
 void muse_state_set_cjk_page(int cols, int lines);
 void muse_state_page(bool cjk, int *cols, int *lines);
+void muse_state_set_reply_page(int page, int pages);
+void muse_state_reply_page(int *page, int *pages);
 
 void muse_state_set_power(const muse_power_t *power);
 muse_power_t muse_state_power(void);

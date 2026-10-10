@@ -32,6 +32,7 @@
 #include "src/misc/lv_area_private.h"            /* lv_area_intersect, for the ring */
 
 #include "muse_ble.h"
+#include "muse_approval.h"
 #include "muse_board.h"
 #include "muse_chat.h"
 #include "muse_console.h"
@@ -110,11 +111,15 @@ static lv_obj_t *s_name_lbl;    /* this gadget's own name, to tell it from the n
 static lv_obj_t *s_power_lbl;
 static lv_obj_t *s_caption_lbl;
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
+static lv_obj_t *s_reply_page_lbl;  /* compact layout: current/total page */
 static lv_obj_t *s_meter[METER_SEGS];
 static lv_obj_t *s_speaker;
 static lv_obj_t *s_speaker_icon;
 static lv_obj_t *s_aux_icon;
 static lv_obj_t *s_image;   /* display.draw_url, over the face */
+static lv_obj_t *s_approval;
+static lv_obj_t *s_approval_prompt;
+static lv_obj_t *s_approval_detail;
 #if CONFIG_MUSE_WATCHER_CAMERA
 static lv_obj_t *s_camera_hint;
 #endif
@@ -144,6 +149,7 @@ static int s_preview_brightness = -1;
 static int s_shown_page = -1;
 static int s_shown_speaker = -1;
 static muse_mode_t s_last_mode = MUSE_MODE_COUNT;
+static uint32_t s_approval_version = UINT32_MAX;
 
 /*
  * While Muse is thinking or speaking it shrinks to make room for the reply:
@@ -155,7 +161,7 @@ typedef struct {
     int cols, lines;          /* the reply's page */
     int w, h, top;            /* and where it goes */
     lv_text_align_t align;
-    lv_obj_t *hides[4];       /* what it covers */
+    lv_obj_t *hides[6];       /* what it covers */
 } answer_layout_t;
 
 enum { ANSWER_HEARD, ANSWER_READ };
@@ -609,7 +615,7 @@ static void set_answer(int which)
             lv_obj_add_flag(l->hides[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (!muse_board->round) {
+    if (s_ring && !muse_board->round) {
         lv_obj_set_flag(s_ring, LV_OBJ_FLAG_HIDDEN, l != NULL);   /* the reply runs past a rectangle's ring */
     }
     if (l) {
@@ -749,6 +755,58 @@ static void build_answer(lv_obj_t *face, int ring_in)
     s_answers[ANSWER_READ].hides[1] = s_name_lbl;   /* the reply takes the top too */
     add_hides(&s_answers[ANSWER_READ], 2);
     add_hides(&s_answers[ANSWER_HEARD], 0);
+}
+
+/*
+ * A 240 px display has no useful room for both Muse and a readable reply.
+ * Keep the connectivity row, replace the rest of the face with a page, then
+ * restore the character when the answer ends. This is deliberately a general
+ * compact-screen layout rather than a Xiaozhi-specific caption exception.
+ */
+static void build_small_answer(lv_obj_t *face)
+{
+    const lv_font_t *font = caption_font();
+    int cw = lv_font_get_glyph_width(font, 'M', ' ');
+    int pitch = lv_font_get_line_height(font) + CAPTION_LINE_SPACE;
+    int top_px = 26;                         /* below the connectivity row */
+    int page_w = s_w - 16;
+    int page_h = s_h - top_px - 22;           /* reserve a row for 1/3 */
+    int cols = page_w / cw;
+    int lines = (page_h + CAPTION_LINE_SPACE) / pitch;
+
+    answer_layout_t *l = &s_answers[ANSWER_READ];
+    l->px = s_canvas_px;                     /* hidden, but keeps the return animation neutral */
+    l->y = s_big_y;
+    l->align = LV_TEXT_ALIGN_LEFT;
+    set_reply_box(l, cols, lines, top_px - s_h / 2, cw, pitch);
+    l->hides[0] = s_canvas;
+    l->hides[1] = s_state_lbl;
+    l->hides[2] = s_name_lbl;
+    l->hides[3] = s_mic_icon;
+    l->hides[4] = s_aux_icon;
+
+    s_reply_lbl = make_label(face, font, COLOR_CAPTION);
+    lv_obj_set_style_text_line_space(s_reply_lbl, CAPTION_LINE_SPACE, 0);
+    lv_obj_set_style_bg_color(s_reply_lbl, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_reply_lbl, LV_OPA_COVER, 0);
+    lv_label_set_long_mode(s_reply_lbl, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_remove_flag(s_reply_lbl, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_reply_lbl);
+
+    s_reply_page_lbl = make_label(face, &lv_font_unscii_8, COLOR_CAPTION);
+    lv_obj_set_style_bg_color(s_reply_page_lbl, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_reply_page_lbl, LV_OPA_COVER, 0);
+    lv_obj_align(s_reply_page_lbl, LV_ALIGN_BOTTOM_RIGHT, -8, -4);
+    lv_obj_add_flag(s_reply_page_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_reply_page_lbl);
+
+#if CONFIG_MUSE_CJK_FONT
+    /* The fallback CJK glyphs are 16 px wide; page them by visible glyphs. */
+    muse_state_set_cjk_page(page_w / 16, lines);
+#endif
+    ESP_LOGI(TAG, "compact reply page: %d x %d (%d x %d CJK)", cols, lines,
+             page_w / 16, lines);
 }
 
 /*
@@ -917,6 +975,7 @@ static void build_screen(void)
         lv_obj_set_size(s_bar, 0, 3);
         lv_obj_set_style_bg_opa(s_bar, LV_OPA_COVER, 0);
         lv_obj_align(s_bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        build_small_answer(face);
         return;
     }
     /* Fixed height: a longer caption ends in dots rather than growing into the ring. */
@@ -1020,6 +1079,76 @@ static void on_any_press(lv_event_t *e)
     muse_state_poke();
 }
 
+static void build_approval(void)
+{
+    s_approval = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_approval);
+    lv_obj_set_size(s_approval, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_approval, lv_color_hex(0x0d0a18), 0);
+    lv_obj_set_style_bg_opa(s_approval, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_approval, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_set_style_border_width(s_approval, s_small ? 3 : 5, 0);
+    lv_obj_set_style_pad_all(s_approval, 0, 0);
+    lv_obj_remove_flag(s_approval, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = make_label(
+        s_approval, font_pick(&lv_font_montserrat_20, &lv_font_montserrat_16), COLOR_ACCENT);
+    lv_label_set_text(title, "ACTION REQUIRED");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, s_small ? 10 : 22);
+
+    s_approval_prompt = make_label(s_approval, caption_font(), COLOR_LIT);
+    lv_obj_set_width(s_approval_prompt, s_w - (s_small ? 24 : 64));
+    lv_obj_set_height(s_approval_prompt, s_small ? s_h - 126 : s_h - 190);
+    lv_obj_set_style_text_align(s_approval_prompt, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(s_approval_prompt, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_align(s_approval_prompt, LV_ALIGN_TOP_MID, 0, s_small ? 42 : 68);
+
+    s_approval_detail = make_label(s_approval, caption_font(), COLOR_DIM);
+    lv_obj_set_width(s_approval_detail, s_w - (s_small ? 24 : 64));
+    lv_obj_set_height(s_approval_detail, s_small ? 36 : 58);
+    lv_obj_set_style_text_align(s_approval_detail, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(s_approval_detail, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_align(s_approval_detail, LV_ALIGN_BOTTOM_MID, 0, s_small ? -43 : -70);
+
+    lv_obj_t *approve = make_label(
+        s_approval, font_pick(&lv_font_montserrat_16, FONT_COMPACT), 0x66ff9a);
+    lv_label_set_text(approve, "TALK\nAPPROVE");
+    lv_obj_align(approve, LV_ALIGN_BOTTOM_LEFT, s_small ? 18 : 48, s_small ? -7 : -18);
+
+    lv_obj_t *deny = make_label(
+        s_approval, font_pick(&lv_font_montserrat_16, FONT_COMPACT), 0xff668a);
+    lv_label_set_text(deny, "VOLUME\nDENY");
+    lv_obj_align(deny, LV_ALIGN_BOTTOM_RIGHT, s_small ? -18 : -48, s_small ? -7 : -18);
+
+    lv_obj_add_flag(s_approval, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* The approval card is independent of the voice mode: a THINKING/SPEAKING
+ * update cannot dismiss it while a person is deciding. */
+static bool update_approval(void)
+{
+    char prompt[MUSE_APPROVAL_PROMPT_MAX + 1];
+    char detail[MUSE_APPROVAL_DETAIL_MAX + 1];
+    uint32_t version;
+    bool active = muse_approval_snapshot(
+        prompt, sizeof(prompt), detail, sizeof(detail), &version);
+    if (!active) {
+        lv_obj_add_flag(s_approval, LV_OBJ_FLAG_HIDDEN);
+        return false;
+    }
+    if (version != s_approval_version) {
+        s_approval_version = version;
+        lv_label_set_text(s_approval_prompt, prompt);
+        lv_label_set_text(s_approval_detail, detail);
+        lv_obj_set_flag(s_approval_detail, LV_OBJ_FLAG_HIDDEN, !detail[0]);
+    }
+    lv_obj_remove_flag(s_approval, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_approval);
+    lv_obj_invalidate(s_approval);
+    muse_approval_mark_visible(version);
+    return true;
+}
+
 static void build_overlays(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -1100,6 +1229,7 @@ static void build_overlays(void)
     if (s_indev) {
         lv_indev_add_event_cb(s_indev, on_any_press, LV_EVENT_PRESSED, NULL);
     }
+    build_approval();
 }
 
 static void apply_brightness(int pct)
@@ -1402,8 +1532,10 @@ static void update_status(muse_mode_t mode, float now)
     bool fresh = muse_state_caption(caption, sizeof(caption), &s_caption_version);
     int answer = -1;
     if (s_reply_lbl) {
-        /* The speaker picks the layout, even mid-reply: the voice task pages to fit. */
-        int layout = muse_settings_speaker_on() ? ANSWER_HEARD : ANSWER_READ;
+        /* Muse replies are currently text-only. The speaker setting controls
+         * local chirps, not cloud TTS, so always give the reply the large
+         * reading layout instead of squeezing it below the avatar. */
+        int layout = ANSWER_READ;
         if (layout != s_page_for) {
             muse_state_set_page(s_answers[layout].cols, s_answers[layout].lines);
             s_page_for = layout;
@@ -1428,6 +1560,15 @@ static void update_status(muse_mode_t mode, float now)
         if (s_reply_lbl) {
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
+    }
+    if (s_reply_page_lbl) {
+        int page, pages;
+        muse_state_reply_page(&page, &pages);
+        bool show_page = answer >= 0 && pages > 1;
+        if (show_page) {
+            lv_label_set_text_fmt(s_reply_page_lbl, "%d/%d", page, pages);
+        }
+        lv_obj_set_flag(s_reply_page_lbl, LV_OBJ_FLAG_HIDDEN, !show_page);
     }
     update_power(now);
 }
@@ -1492,6 +1633,9 @@ static void frame_tick(lv_timer_t *timer)
         s_last_mode = mode;
     }
     if (update_sleep()) {
+        return;
+    }
+    if (update_approval()) {
         return;
     }
     update_chrome(now);

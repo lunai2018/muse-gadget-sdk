@@ -1263,6 +1263,31 @@ static char *build_register_json(void) {
                 "voltage, and whether it is charging or on USB power; each is "
                 "null when the device has no battery or can't measure it",
                 nullptr, nullptr);
+#if CONFIG_MUSE_ENABLED
+    cJSON *approval_required = cJSON_CreateObject();
+    cJSON_AddItemToObject(
+        approval_required, "prompt",
+        string_param("Short question shown to the person on the gadget."));
+    cJSON *approval_optional = cJSON_CreateObject();
+    cJSON_AddItemToObject(
+        approval_optional, "detail",
+        string_param("Optional concise context about the action being confirmed."));
+    cJSON *approval_timeout = cJSON_CreateObject();
+    cJSON_AddStringToObject(approval_timeout, "type", "integer");
+    cJSON_AddStringToObject(
+        approval_timeout, "description",
+        "Seconds to wait for a physical decision, 5 to 120; default 30.");
+    cJSON_AddItemToObject(approval_optional, "timeout_s", approval_timeout);
+    add_command(
+        commands, "approval.request",
+        "Ask the person at this gadget to approve or deny a proposed action. "
+        "Use only before an action that needs explicit confirmation. The gadget "
+        "shows a full-screen card and waits for its physical buttons; the result "
+        "contains approved=true or false and a reason. A timeout denies the action.",
+        approval_required, approval_optional);
+    cJSON_AddNumberToObject(
+        cJSON_GetObjectItem(commands, "approval.request"), "timeout_ms", 125000);
+#endif
 #if CONFIG_HOMEHUB_TUNNEL
     add_command(commands, "device.discover",
                 "Scan local network for devices (ARP, mDNS, SSDP, SNMP, NetBIOS)",
